@@ -1,0 +1,2 @@
+这是一份草稿，用来演示「用户确认 delete_note(path="draft.txt") 之后，
+Agent 不能把参数改成 report.txt 并继续复用原来的确认」。

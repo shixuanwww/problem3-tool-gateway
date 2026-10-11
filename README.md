@@ -20,7 +20,7 @@ node --experimental-strip-types scripts/reset.ts
 |---|---|
 | `server/data/*.json` / `*.jsonl` / `*.tmp` / `*.corrupt-*` | 清空（approvals / audit / executions） |
 | `sandbox/outbox/*.json` | 清空（保留 `.gitkeep`） |
-| `sandbox/notes/*` | **恢复初始夹具**：`todo.md`（内容 `buy milk`）、`draft.txt`；保留 `.gitkeep` |
+| `sandbox/notes/*` | **恢复初始夹具**：`todo.md`（内容 `buy milk`）、`draft.txt`；保留 `.gitkeep`。这两个夹具**已入库**（题面目录树要求它们出现在交付物里，见 §10） |
 
 > ⚠️ 只清不建会让场景 1 与用例 1 在重置后必红，所以夹具是**重建**不是清空。
 
@@ -264,7 +264,8 @@ problem3-tool-gateway/
 
 - **git 分阶段 commit**：按阶段（Basic → 进阶 → Challenge）提交，便于评审了解动态
 - **留下 session**：与 AI 协作的对话记录 / 分享链接
-- **`.gitignore`**（已就位）：`server/data/`、`sandbox/outbox/*.json`、`sandbox/notes/*`（保留 `.gitkeep`）、`node_modules/`
+- **`.gitignore`**（已就位）：`server/data/*`（运行时状态）、`sandbox/outbox/*.json`（模拟邮件）、`node_modules/`。
+  🔴 **`sandbox/notes/{todo.md,draft.txt}` 不忽略、已入库** —— 它们是题面 §2.2 目录树明确列出的交付夹具，忽略掉会让新克隆的仓库里 `sandbox/notes/` 只剩一个 `.gitkeep`（题面要求的目录树不完整）。它们由 `scripts/reset.ts` 按固定内容确定性重建，所以入库不影响"可重置"这条性质
 - **仓库根目录名**：题面目录树写的是 `agent-tool-gateway/` ⇒ 提交/打包时把本目录改名为 `agent-tool-gateway`；若沿用 `problem3-tool-gateway`，须在提交说明中明确**本题即该仓库**
 - **`docs/defense/`《答辩问答》**（已就位）：题面说"会对项目细节深入提问，**如果答不出细节可能会被认为过度使用 AI**" —— 这是唯一的评分门
 - **净室自检**：参考了开源项目的**设计思路**（如"一次性审批""evidence trail""prompts are not security boundaries"这类论证），**未复制任何代码文本**。交付前全局搜索参考项目专有标识符（`capfence` / `AegisGov` / `cordon` / `ipiguard` 等）**应为零命中**

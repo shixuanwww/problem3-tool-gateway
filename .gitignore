@@ -6,12 +6,16 @@ dist/
 server/data/*
 !server/data/.gitkeep
 
-# 沙箱里的运行期产物：只保留占位文件，其余不入库
+# 沙箱里**真正**的运行期产物：模拟发送出去的邮件
 sandbox/outbox/*.json
 !sandbox/outbox/.gitkeep
 
-sandbox/notes/*
-!sandbox/notes/.gitkeep
+# ⚠️ sandbox/notes/ 的 todo.md 与 draft.txt **要入库**，不要在这里加回忽略规则。
+#    理由：① 题面 §2.2 的目录树把它们列进"项目至少包含"——
+#              忽略它们会让新克隆的仓库里 sandbox/notes/ 只剩 .gitkeep，交付目录树不完整；
+#          ② 它们是**确定性夹具**：scripts/reset.ts 的 INITIAL_NOTES 每次按固定内容重建，
+#              入库不会引入随机性，且跑完 reset 后 git status 依然是干净的。
+#    （跑过 delete_note 演示后 draft.txt 会显示为 deleted，执行一次 reset.ts 即恢复。）
 
 # 环境变量
 .env
