@@ -7,11 +7,17 @@
 //   GET  /audit[?call_id=]                    ← 便于演示/测试（同样走用户通道，需令牌）
 //   GET  /health
 //
-// 🔴 两个通道的认证口径（P1）：
+// 🔴 两个通道的认证口径（P1；第三轮审核收紧为"只认请求头"）：
 //   · Agent 通道（POST /tool-calls）**不要求**令牌 —— Agent 本来就只负责提出调用；
 //   · 用户通道（POST /approvals/{id}/decision、GET /audit）**必须**携带
-//     `x-approval-secret`（或请求体 `approval_secret`），令牌由 Gateway 生成、只给用户侧 Client。
+//     `x-approval-secret` **请求头**，令牌由 Gateway 生成、只给用户侧 Client。
 //   这样模型 / 被提示词注入的调用无法自己 approve 自己。
+//
+// 🔴 **只认请求头，不认请求体**（第三轮审核收紧，改前允许 body `approval_secret`）：
+//    令牌是"持有者即用户"的凭证；一旦允许它躺在请求体里，就会跟着请求体一起进
+//    日志 / 抓包 / 回放记录，而**请求体恰恰是 Agent 唯一能自由构造的地方** ——
+//    等于把用户通道的边界建在对手手里。请求体里出现 `approval_secret` 一律忽略
+//    （与 §4.1「忽略客户端提交的策略字段」同源）。
 //
 // 🔴 错误码口径：业务拒绝仍是 400 / 409；**401** 专用于"用户通道没通过认证"；
 //    **413** = 请求体超 1MB；**503** = 持久化锁竞争/磁盘错误的兜底（非策略决定）。
@@ -72,16 +78,15 @@ function readBody(req: http.IncomingMessage): Promise<BodyResult> {
   });
 }
 
-/** 用户通道令牌：优先 header，其次允许 body 字段（方便 curl / 测试） */
-function approvalSecretOf(
-  req: http.IncomingMessage,
-  body?: Record<string, unknown>,
-): string | undefined {
+/**
+ * 用户通道令牌：**只认 `x-approval-secret` 请求头**。
+ *
+ * 🔴 请求体里的 `approval_secret` 故意不读（理由见文件头）。
+ * ⚠️ 不做"多值/重复头"解析：重复头会被 Node 折成逗号串，长度必然不等 ⇒ 直接判不匹配。
+ */
+function approvalSecretOf(req: http.IncomingMessage): string | undefined {
   const h = req.headers['x-approval-secret'];
-  if (typeof h === 'string') return h;
-  return typeof body?.['approval_secret'] === 'string'
-    ? (body['approval_secret'] as string)
-    : undefined;
+  return typeof h === 'string' ? h : undefined;
 }
 
 async function handleRequest(
@@ -160,7 +165,7 @@ async function handleRequest(
     const out = await service.handleDecision(approvalId, {
       action: typeof body['action'] === 'string' ? body['action'] : undefined,
       user_id: typeof body['user_id'] === 'string' ? body['user_id'] : 'user_default',
-      approval_secret: approvalSecretOf(req, body),
+      approval_secret: approvalSecretOf(req),
     });
     return json(res, out.http, out.body);
   }

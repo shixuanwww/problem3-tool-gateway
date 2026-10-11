@@ -9,7 +9,7 @@
     "server": "node --experimental-strip-types server/index.ts",
     "client": "node --experimental-strip-types client/index.ts --scenario all",
     "mcp": "node --experimental-strip-types server/mcp/server.ts",
-    "test": "node --experimental-strip-types --test --test-concurrency=1 tests/basic.test.ts tests/advanced.test.ts tests/challenge.test.ts"
+    "test": "node --experimental-strip-types --test --test-concurrency=1 tests/sandbox.test.ts tests/basic.test.ts tests/advanced.test.ts tests/challenge.test.ts"
   },
   "engines": {
     "node": ">=22.6.0"

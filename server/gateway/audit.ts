@@ -49,7 +49,13 @@ function fmt(entry: AuditEntry): string {
     `approval_result=${entry.approval_result}`,
     `execution_result=${entry.execution_result}`,
   ];
-  return `[audit] user=${entry.user_id} ${parts.join(' ')}${entry.detail ? ' detail=' + entry.detail : ''}`;
+  const extra = [
+    entry.deny_reason ? `deny_reason=${entry.deny_reason}` : '',
+    entry.detail ? `detail=${entry.detail}` : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
+  return `[audit] user=${entry.user_id} ${parts.join(' ')}${extra ? ' ' + extra : ''}`;
 }
 
 /**

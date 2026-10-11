@@ -83,6 +83,8 @@ export interface AuditEntry {
   // ↓ 便于追查的补充字段（题面说"至少包含"，允许多写）
   approval_id?: string;
   argument_hash?: string;
+  /** 沙箱/校验拒绝时的具体原因（第四轮：让"哪道闸门拦的"可被审计证明）。对外响应仍是统一文案 */
+  deny_reason?: string;
   /** 🔴 禁止写入邮件正文 / 文件内容原文（§11 / 附二 5） */
   detail?: string;
 }

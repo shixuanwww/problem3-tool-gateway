@@ -220,6 +220,7 @@ export class GatewayService {
       execution_result: AuditEntry['execution_result'];
       approval_id?: string;
       argument_hash?: string;
+      deny_reason?: string;
       detail?: string;
     },
   ): void {
@@ -233,6 +234,7 @@ export class GatewayService {
       execution_result: fields.execution_result,
       ...(fields.approval_id ? { approval_id: fields.approval_id } : {}),
       ...(fields.argument_hash ? { argument_hash: fields.argument_hash } : {}),
+      ...(fields.deny_reason ? { deny_reason: fields.deny_reason } : {}),
       ...(fields.detail ? { detail: fields.detail } : {}),
     };
     appendAudit(entry);
@@ -275,6 +277,7 @@ export class GatewayService {
         approval_result: AuditEntry['approval_result'];
         approval_id: string;
         argument_hash: string;
+        deny_reason: string;
       }> = {},
     ): HttpResult => {
       this.audit(base, {
@@ -283,6 +286,7 @@ export class GatewayService {
         execution_result: 'skipped',
         ...(extra.approval_id ? { approval_id: extra.approval_id } : {}),
         ...(extra.argument_hash ? { argument_hash: extra.argument_hash } : {}),
+        ...(extra.deny_reason ? { deny_reason: extra.deny_reason } : {}),
         ...(policyNote ? { detail: policyNote } : {}),
       });
       return {
@@ -311,8 +315,8 @@ export class GatewayService {
           ? resolveInSandbox(def.allowedRoot, raw)
           : { ok: false as const, reason: '缺少 path' };
       if (!p.ok) {
-        // 题面示例的原话措辞
-        return deny(400, `目标路径超出 ${def.allowedRoot}`);
+        // 对外：题面示例的原话措辞；审计里：留具体闸门原因（deny_reason），可事后举证
+        return deny(400, `目标路径超出 ${def.allowedRoot}`, { deny_reason: p.reason });
       }
     }
 

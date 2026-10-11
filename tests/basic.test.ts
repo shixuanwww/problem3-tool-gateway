@@ -192,6 +192,25 @@ test('用例 6 — 路径不能越过沙箱（../、绝对路径、盘符、ADS�
     assert.equal(body(r).reason, '目标路径超出 sandbox/notes');
   }
 
+  // 第四轮补强：审计必须留下**具体闸门原因**（deny_reason），否则"NUL/ADS 闸门生效"拿不出运行时证据
+  for (const [label, p] of cases) {
+    const row = readAudit(`call_006_${label}`).at(-1)!;
+    assert.equal(row.decision, 'deny', `${label} 应留 deny 审计`);
+    assert.ok(
+      typeof row.deny_reason === 'string' && row.deny_reason.length > 0,
+      `${label} 的审计必须带非空 deny_reason`,
+    );
+    assert.notEqual(
+      row.deny_reason,
+      '目标路径超出 sandbox/notes',
+      'deny_reason 应是具体闸门原因，而非对外统一文案',
+    );
+    // 逐条对得上号：NUL → 控制字符；ADS → 冒号；其余 → 绝对路径或点/空格段
+    if (p.includes('\u0000')) assert.match(row.deny_reason!, /控制字符/);
+    else if (p.includes('::')) assert.match(row.deny_reason!, /:/);
+    else assert.match(row.deny_reason!, /绝对路径|点\/空格段/);
+  }
+
   // 符号链接：前两道闸门都拦不住（路径里没有 .. 也不是绝对路径），只有 realpath 能挡
   const link = path.join(NOTES_DIR, 'link');
   if (trySymlink(path.join('..', '..', 'config.json'), link)) {

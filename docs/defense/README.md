@@ -8,7 +8,7 @@
 | # | 模块 | 文件 | 对应代码 |
 |---|---|---|---|
 | 1 | 可信工具表 + 参数校验器 | `01-registry-and-validate.md` | `server/gateway/registry.ts` `validate.ts` |
-| 2 | 沙箱三道闸门 | `02-sandbox.md` | `server/gateway/sandbox.ts` |
+| 2 | 沙箱四道闸门 | `02-sandbox.md` | `server/gateway/sandbox.ts` |
 | 3 | 五步决策与优先级 | `03-service-five-steps.md` | `server/gateway/service.ts` |
 | 4 | 确认的精确绑定 | `04-approval-binding.md` | `canonical.ts` `service.ts` |
 | 5 | 一次性与并发 | `05-once-and-concurrency.md` | `service.ts` `handleDecision` |
