@@ -1,0 +1,9 @@
+{
+  "_comment": "沙箱**外**的测试夹具（无敏感值）。场景 3 用它证明：越界删除被拒绝后，沙箱外的文件不受影响。",
+  "app": "agent-tool-gateway-demo",
+  "featureFlags": {
+    "enableAudit": true,
+    "enableMcp": false
+  },
+  "maxConcurrentExecutions": 1
+}

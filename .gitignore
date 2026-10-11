@@ -1,0 +1,17 @@
+# 依赖与构建产物
+node_modules/
+dist/
+
+# 运行时产物（Gateway 的持久化与审计）—— 目录保留，内容忽略
+server/data/*
+!server/data/.gitkeep
+
+# 沙箱里的运行期产物：只保留占位文件，其余不入库
+sandbox/outbox/*.json
+!sandbox/outbox/.gitkeep
+
+sandbox/notes/*
+!sandbox/notes/.gitkeep
+
+# 环境变量
+.env

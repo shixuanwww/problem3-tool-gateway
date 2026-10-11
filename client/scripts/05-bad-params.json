@@ -1,0 +1,8 @@
+{
+  "call_id": "call_005",
+  "tool_name": "send_email",
+  "arguments": {
+    "subject": "作业链接",
+    "body": "这是本次作业的文档链接。"
+  }
+}

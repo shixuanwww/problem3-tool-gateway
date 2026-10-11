@@ -1,0 +1,17 @@
+{
+  "name": "problem3-tool-gateway",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Agent ToolCall Gateway —— 2026 秋招 Web/Agent 组熬测题 第 3 题《先别执行！——Agent 工具调用安全网关》",
+  "scripts": {
+    "reset": "node --experimental-strip-types scripts/reset.ts",
+    "server": "node --experimental-strip-types server/index.ts",
+    "client": "node --experimental-strip-types client/index.ts --scenario all",
+    "mcp": "node --experimental-strip-types server/mcp/server.ts",
+    "test": "node --experimental-strip-types --test --test-concurrency=1 tests/basic.test.ts tests/advanced.test.ts tests/challenge.test.ts"
+  },
+  "engines": {
+    "node": ">=22.6.0"
+  }
+}

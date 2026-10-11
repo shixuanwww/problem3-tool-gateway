@@ -1,0 +1,7 @@
+{
+  "call_id": "call_003",
+  "tool_name": "delete_note",
+  "arguments": {
+    "path": "../../config.json"
+  }
+}

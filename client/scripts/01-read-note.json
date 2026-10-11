@@ -1,0 +1,7 @@
+{
+  "call_id": "call_002",
+  "tool_name": "read_note",
+  "arguments": {
+    "path": "todo.md"
+  }
+}

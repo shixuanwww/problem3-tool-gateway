@@ -1,0 +1,2 @@
+# 模拟发送的邮件落在这里（sandbox/outbox/<message_id>.json）
+# 运行期产物已在 .gitignore 中忽略，只保留本占位文件

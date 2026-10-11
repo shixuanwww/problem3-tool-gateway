@@ -1,0 +1,3 @@
+# 运行时产物目录（approvals.json / audit.jsonl / executions.jsonl）
+# 内容已 gitignore，此文件只为让目录进 git。
+# 演示与测试前请先跑 scripts/reset.ts。
