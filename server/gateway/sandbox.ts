@@ -54,6 +54,12 @@ export function resolveInSandbox(root: string, userPath: string): SandboxResult 
     return { ok: false, reason: 'path 必须是非空字符串' };
   }
 
+  // ---- 闸门 0：拒绝控制字符（NUL 会一路穿过 path.resolve，最后在 fs 层才炸）----
+  // 注意：JSON 里可以用 \u0000 表达 NUL，所以这不是理论问题。
+  if (/[\u0000-\u001f]/.test(userPath)) {
+    return { ok: false, reason: `路径包含控制字符（如 NUL）` };
+  }
+
   // ---- 闸门 1：拒绝绝对路径（POSIX 绝对路径 + Windows 盘符 + UNC）----
   if (path.isAbsolute(userPath) || WIN_DRIVE.test(userPath) || /^\\\\/.test(userPath)) {
     return { ok: false, reason: `拒绝绝对路径: ${userPath}` };
@@ -63,11 +69,22 @@ export function resolveInSandbox(root: string, userPath: string): SandboxResult 
     return { ok: false, reason: `拒绝绝对路径: ${userPath}` };
   }
 
-  // ---- 闸门 2：拒绝任何含 ".." 的**段**（在归一化之前查，避免被 resolve 吞掉）----
-  // 不只看开头 —— "a/../../b" 也必须拒
+  // ---- 闸门 2：按**段**拒绝穿越形态（在归一化之前查，避免被 resolve 吞掉）----
+  // 两种都要拦，不只看开头：
+  //   ① 只由点/空格组成的段：'.' 是当前目录（放行），其余（".." / "..." / ".. " / " ."…）
+  //      在任何平台都不是合法文件名 —— Windows 会把段末尾的点与空格规范化掉，
+  //      所以 ".. " 这类写法语义上等价于 ".."。"./todo.md" 这种正常写法仍然放行。
+  //   ② ':' 是 Windows 的 ADS 分隔符 ⇒ "todo.md::$DATA" 会绕过"只读这个文件"的直觉
+  //      （实测改前这条路径返回 200 allow executed）。
   const segments = userPath.split(/[\\/]+/);
-  if (segments.some((s) => s === '..')) {
-    return { ok: false, reason: `路径包含 ".." 段: ${userPath}` };
+  for (const seg of segments) {
+    if (seg === '') continue;
+    if (/^[ .]+$/.test(seg) && seg !== '.') {
+      return { ok: false, reason: `路径包含可疑的点/空格段: ${userPath}` };
+    }
+    if (seg.includes(':')) {
+      return { ok: false, reason: `路径段包含非法字符 ':': ${userPath}` };
+    }
   }
 
   // ---- 闸门 3：归一化 + realpath + 前缀比对 ----

@@ -1,6 +1,6 @@
 # 模块 6：审计与持久化
 
-**代码**：`server/gateway/audit.ts`、`service.ts` 的 `loadState` / `persistState`
+**代码**：`server/gateway/audit.ts`、`service.ts` 的 `loadState` / `persistStateLocked`、`server/gateway/persist.ts`、`server/gateway/secret.ts`
 
 ## 1. 这段在干什么
 
@@ -16,10 +16,14 @@
 | 7 个必需字段 + 3 个可选补充字段 | 题面说"至少包含"这 7 项，那么多写是允许的。`approval_id` / `argument_hash` / `detail` 都是追查现场时最想要的东西 |
 | 🔴 `detail` **禁止**出现邮件正文或文件内容原文 | 审计日志会被长期保留、被多方读取。把邮件正文写进去 = 把用户数据复制到另一个不受保护的通道。测试里有断言：审计文件全文不得包含演示用的邮件正文 |
 | 审计**同时打印到终端** | 题面原话允许"terminal 显示或者写进 log"，那就两边都给 —— 演示时不用额外 `tail` 文件 |
-| `approvals.json` **原子写**（`.tmp` + `renameSync`） | `rename` 在同一文件系统内是原子的 ⇒ 要么看到旧版本、要么看到新版本，不会看到写了一半的文件 |
+| `approvals.json` **原子写**（**唯一临时名** + `renameSync`） | `rename` 在同一文件系统内是原子的 ⇒ 要么看到旧版本、要么看到新版本，不会看到写了一半的文件。临时名带 `pid + 随机数`：改前用固定名 `approvals.json.tmp`，两个进程同时写会互相 rename/删除，**实测直接抛 `ENOENT`** |
+| 🔴 "读磁盘 → 合并 → 写磁盘"整段放在**跨进程文件锁**里（`persist.ts`） | 改前 `persistState()` 是"把本进程内存**全量覆盖**磁盘"，跨进程 last-writer-wins ⇒ 会把别的进程刚写下的 `used=true` 擦回 `false`，确认"复活"、可能重复副作用；两个进程还会各自从 `seq=0` 起算撞同一个 `approval_id`。现在合并规则是**单调**的：`used` 取或、`decided` 磁盘优先、`seq` 取最大 |
+| 用户确认令牌**单独落盘**（`server/data/approval-secret`，0600）且**不写进审计原文** | 确认接口必须带它（P1）。审计里只可能出现 `401` 的拒绝记录，不会记录令牌内容；令牌不进 git（`server/data/*` 已 ignore） |
 | 🔴 启动载入解析失败时**不静默重置**，而是改名 `approvals.json.corrupt-<ts>` + 告警 | 静默清空 = 用户所有的待确认记录凭空消失，而且**没人会发现**。改名保留现场，至少能事后查为什么坏了 |
 | JSONL 逐行解析、**跳过并计数**损坏行 | 一行坏掉不应该让整个审计文件不可读（审计的价值在于"尽可能多地留下痕迹"，而不是"要么全有要么全无"） |
+| 🔴 启动时把损坏行数**打印出来**（`reportCorruptJsonl()`） | 只"跳过"而不"计数上报"等于静默丢数据 —— 事后没人知道审计缺了一段。构造 `GatewayService`（= 进程启动）时读 audit/executions 各一次，`corrupt > 0` 就打 stderr 警告 |
 | 序号 `seq` 也一起落盘 | 否则重启后 `approval_id` / `message_id` 从 1 重新开始，会**覆盖**或**撞号**，演示断言也全部失效 |
+| 畸形请求也要写审计：`call_id` / `tool_name` 缺失时用 `(missing)` 占位 | 题面要求这 7 个字段"至少包含"。写空串会让"审计条数 ↔ 请求条数"对账出现无法归因的行；写占位符既留痕、又能看出这是畸形请求 |
 
 ## 3. 可能被追问的问题
 
@@ -33,7 +37,10 @@ A：`not_required` —— 工具不需要确认（`read_note` 的 `allow` 路径
 A：不会。`used` / `decided` / `result` 都在 `approvals.json` 里。用例 14 用"新起一个 `GatewayService`"模拟重启：断言 `used === true` 仍在、再确认一次仍被拒（409 确认已使用）、重发同一调用返回**已存结果**且 `outbox/` 数量不变。
 
 **Q：`server/data/` 要不要进 git？**
-A：**不进**（已在 `.gitignore`）。它是运行时产物，且演示前必须 `reset.ts`。仓库里保留 `.gitkeep` 让目录存在。
+A：**不进**（已在 `.gitignore`）。它是运行时产物，且演示前必须 `reset.ts`。仓库里保留 `.gitkeep` 让目录存在。**用户确认令牌** `approval-secret` 也在该目录下，所以同样不会入库。
+
+**Q：多个进程同时写 `approvals.json` 会不会丢更新？**
+A：不会（同机范围内）。`withStateLock()` 用 `open(...,'wx')` 原子抢锁，锁内先 `readStateSnapshot()` 再 `mergeApproval()` 单调合并，最后唯一临时名 + rename 写回。实测 4 个真实进程同时创建调用：拿到 4 个不同的 `approval_id`，磁盘 4 条一条不丢。僵尸锁 15s 后会被抢占，等待方 5s 超时抛错。
 
 **Q：为什么不用数据库？**
 A：题面不要求；且本题的考点是**决策与边界**，不是存储。引入 DB 会让"评审机现场跑起来"多一个失败点（要装服务、要连、要初始化）。用 JSON + JSONL 是"零依赖、可读、可 grep"的最优解。

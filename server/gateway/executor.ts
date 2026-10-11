@@ -12,7 +12,7 @@
 
 import path from 'node:path';
 import { DATA_DIR } from './sandbox.ts';
-import { argumentHash, hashOfCall } from './canonical.ts';
+import { hashOfCall } from './canonical.ts';
 import { appendJsonl, readJsonl } from './audit.ts';
 import { builtinTools } from '../tools/index.ts';
 import type { ExecutionRecord, ToolContext, ToolDef, ToolImpl } from './types.ts';
@@ -192,5 +192,3 @@ export class Executor {
     }
   }
 }
-
-export { argumentHash };

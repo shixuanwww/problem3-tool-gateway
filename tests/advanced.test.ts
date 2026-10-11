@@ -14,6 +14,7 @@ import { TOOL_DEFS } from '../server/gateway/registry.ts';
 import { builtinTools } from '../server/tools/index.ts';
 import type { JsonSchema, ToolCallResponse, ToolDef, ToolImpl } from '../server/gateway/types.ts';
 import {
+  decide,
   freshService,
   notePath,
   outboxCount,
@@ -42,7 +43,7 @@ test('用例 9 — 参数绑定：同 call_id 换参数必须被拒，且旧确�
   const base = { call_id: 'call_900', tool_name: 'delete_note' };
   const r = await svc.handleToolCall({ ...base, arguments: { path: 'draft.txt' } }, { user_id: USER });
   assert.equal(body(r).decision, 'require_approval');
-  const d = await svc.handleDecision(body(r).approval_id!, { action: 'approve', user_id: USER });
+  const d = await decide(svc, body(r).approval_id!, 'approve');
   assert.equal(String((d.body as Record<string, unknown>)['status']), 'executed');
   assert.ok(!fs.existsSync(notePath('draft.txt')), '原确认删掉的是 draft.txt');
 
@@ -69,7 +70,7 @@ test('用例 10 — 键序不影响 argument_hash（否则绑定可被绕过）'
 });
 
 test('用例 11 — TOCTOU：确认接口带不同参数也不会改变执行内容（用快照）', async () => {
-  const { base, close } = await startTestServer();
+  const { base, close, service } = await startTestServer();
   try {
     writeNote('report.txt', '报告草稿\n');
     const res0 = await fetch(base + '/tool-calls', {
@@ -88,7 +89,10 @@ test('用例 11 — TOCTOU：确认接口带不同参数也不会改变执行内
       `${base}/approvals/${String(r0['approval_id'])}/decision`,
       {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          'x-approval-secret': service.approvalSecret,
+        },
         body: JSON.stringify({
           action: 'approve',
           user_id: USER,
@@ -150,8 +154,8 @@ test('用例 13 — 并发一次性：同一 approval_id 在同一 tick 里确�
 
   // 不 await 中间，两个请求"同时"提交
   const [a, b] = await Promise.all([
-    svc.handleDecision(id, { action: 'approve', user_id: USER }),
-    svc.handleDecision(id, { action: 'approve', user_id: USER }),
+    decide(svc, id, 'approve'),
+    decide(svc, id, 'approve'),
   ]);
 
   const statuses = [a, b].map((x) =>
@@ -169,7 +173,7 @@ test('用例 14 — 重启恢复：已用的确认不能因为重启就复活', 
     { user_id: USER },
   );
   const id = body(r).approval_id!;
-  await svc1.handleDecision(id, { action: 'approve', user_id: USER });
+  await decide(svc1, id, 'approve');
   const after = outboxCount();
 
   // 新进程（这里用新实例模拟：状态只从 approvals.json 恢复）
@@ -180,7 +184,7 @@ test('用例 14 — 重启恢复：已用的确认不能因为重启就复活', 
   assert.equal(restored!.decided, 'approve');
 
   // 再确认一次仍被拒（第 4 条）
-  const again = await svc2.handleDecision(id, { action: 'approve', user_id: USER });
+  const again = await decide(svc2, id, 'approve');
   assert.equal(again.http, 409);
   assert.equal(String((again.body as Record<string, unknown>)['reason']), '确认已使用');
 
@@ -204,7 +208,7 @@ test('用例 15 — 审计含题面要求的 5 个日志字段', async () => {
     { call_id: 'call_001', tool_name: 'send_email', arguments: EMAIL_ARGS },
     { user_id: USER },
   );
-  await svc.handleDecision(body(p).approval_id!, { action: 'approve', user_id: USER });
+  await decide(svc, body(p).approval_id!, 'approve');
 
   const rows = readAudit();
   assert.ok(rows.length >= 3);
@@ -283,8 +287,8 @@ test('R2 — 同一调用重发后再并发确认：副作用只发生一次（P
 
   const before = outboxCount();
   const results = await Promise.all([
-    svc.handleDecision(a, { action: 'approve', user_id: USER }),
-    svc.handleDecision(b, { action: 'approve', user_id: USER }),
+    decide(svc, a, 'approve'),
+    decide(svc, b, 'approve'),
   ]);
   assert.equal(outboxCount(), before + 1, '并发确认后必须恰好 1 封邮件');
 
@@ -310,7 +314,7 @@ test('R3 — 执行仍在进行中时并发确认：Gateway 拒绝执行（即�
   const id = body(await svc.handleToolCall(call, { user_id: USER })).approval_id!;
 
   // 第一次确认：工具开始执行并挂起
-  const first = svc.handleDecision(id, { action: 'approve', user_id: USER });
+  const first = decide(svc, id, 'approve');
   await sleep(50); // 让第一次真正进入 await
 
   // 执行中重发 ⇒ 非幂等超时/未完成路径会新建一条 Approval（用例 19 的行为）
@@ -318,7 +322,7 @@ test('R3 — 执行仍在进行中时并发确认：Gateway 拒绝执行（即�
   assert.notEqual(id2, id, '执行未完成时重发应新建记录（与用例 19 一致）');
 
   // 第二条也确认 ⇒ 必须被 in-flight 闸门挡下，不得产生第二次副作用
-  const second = await svc.handleDecision(id2, { action: 'approve', user_id: USER });
+  const second = await decide(svc, id2, 'approve');
   assert.equal(second.http, 409, '执行进行中必须拒绝并发执行');
   assert.match(String((second.body as Record<string, unknown>)['reason']), /仍在进行中/);
 
@@ -354,7 +358,7 @@ test('R4 — used 在执行期间就已落盘（进程被杀后确认不复活�
     ),
   ).approval_id!;
 
-  const pending = svc.handleDecision(id, { action: 'approve', user_id: USER });
+  const pending = decide(svc, id, 'approve');
   await sleep(50); // 工具执行中
 
   // 模拟"此刻进程被 kill"：只看磁盘上已经写下的内容
@@ -410,8 +414,127 @@ test('R6 — 确认端点能看到别的实例写下的待确认记录（跨进�
   assert.equal(httpLike.getApproval(id), undefined, '构造时磁盘上还没有这条记录');
 
   const before = outboxCount();
-  const d = await httpLike.handleDecision(id, { action: 'approve', user_id: USER });
+  const d = await decide(httpLike, id, 'approve');
   assert.equal(d.http, 200, '必须能确认另一个实例写下的记录');
   assert.equal(String((d.body as Record<string, unknown>)['status']), 'executed');
   assert.equal(outboxCount(), before + 1);
+});
+
+// ===========================================================================
+// P1 / P2 修复回归（2026-10-11 第二轮审核）
+//   R7 → 确认接口必须有用户通道令牌，Agent 自报 user_id 不再能自己 approve
+//   R8 → 跨实例写盘不能把 used=true 擦回 false（旧实现会全量覆盖）
+//   R9 → 两个实例分配 approval_id 不重复、磁盘不丢记录（旧实现会撞号 + 覆盖）
+// ===========================================================================
+
+test('R7 — 确认接口必须有用户通道令牌（P1 回归：Agent 不能自己 approve）', async () => {
+  const svc = freshService();
+  const r = await svc.handleToolCall(
+    { call_id: 'call_001', tool_name: 'send_email', arguments: EMAIL_ARGS },
+    { user_id: USER },
+  );
+  const id = body(r).approval_id!;
+  const before = outboxCount();
+
+  // ① 改前的伪造方式：只自报 user_id，不带任何令牌
+  const forged = await svc.handleDecision(id, { action: 'approve', user_id: USER });
+  assert.equal(forged.http, 401, '无令牌的确认必须 401');
+  assert.match(String((forged.body as Record<string, unknown>)['reason']), /用户通道认证/);
+  assert.equal(outboxCount(), before, '无令牌必须无副作用');
+
+  // ② 长度相同但内容错误的令牌（覆盖 timingSafeEqual 路径）
+  const wrong = await svc.handleDecision(id, {
+    action: 'approve',
+    user_id: USER,
+    approval_secret: 'deadbeef'.repeat(8),
+  });
+  assert.equal(wrong.http, 401);
+  assert.equal(outboxCount(), before);
+
+  // ③ Agent 通道的响应里绝不能回传用户令牌
+  assert.ok(
+    !JSON.stringify(r.body).includes(svc.approvalSecret),
+    '/tool-calls 响应不得回传用户通道令牌',
+  );
+
+  // ④ 带正确令牌才执行，且恰好一次
+  const ok = await decide(svc, id, 'approve');
+  assert.equal(String((ok.body as Record<string, unknown>)['status']), 'executed');
+  assert.equal(outboxCount(), before + 1);
+
+  // ⑤ 未认证的请求也要留下审计（decision=deny），便于事后追查伪造尝试
+  const forgedRows = readAudit('call_001').filter((x) =>
+    String(x.detail ?? '').includes('用户通道认证'),
+  );
+  assert.ok(forgedRows.length >= 1, '伪造确认必须留审计');
+});
+
+test('R8 — 跨实例写盘不会把 used 擦回 false（P2 回归）', async () => {
+  const a = freshService();
+  const b = new GatewayService(); // 构造早于记录产生 ⇒ 内存里没有它
+
+  const id = body(
+    await a.handleToolCall(
+      { call_id: 'call_001', tool_name: 'send_email', arguments: EMAIL_ARGS },
+      { user_id: USER },
+    ),
+  ).approval_id!;
+  const before = outboxCount();
+
+  const d = await decide(b, id, 'approve');
+  assert.equal(String((d.body as Record<string, unknown>)['status']), 'executed');
+  assert.equal(outboxCount(), before + 1);
+
+  // a 的内存里这条还是 used=false；让它再写一次盘。
+  // 改前 a.persistState() 全量覆盖，会把磁盘上的 used=true 擦回 false。
+  await a.handleToolCall(
+    {
+      call_id: 'call_002',
+      tool_name: 'send_email',
+      arguments: { ...EMAIL_ARGS, subject: '第二封' },
+    },
+    { user_id: USER },
+  );
+
+  const onDisk = JSON.parse(
+    fs.readFileSync(path.join(REPO_ROOT, 'server', 'data', 'approvals.json'), 'utf8'),
+  ) as { approvals: Array<{ approval_id: string; used: boolean; decided?: string }> };
+  const rec = onDisk.approvals.find((x) => x.approval_id === id);
+  assert.ok(rec, '磁盘上必须还有这条记录');
+  assert.equal(rec!.used, true, 'used 必须单调：不能被旧快照擦回 false');
+  assert.equal(rec!.decided, 'approve');
+
+  // 模拟"重启后"：从磁盘重新载入，确认也不能复活
+  const c = new GatewayService();
+  const again = await decide(c, id, 'approve');
+  assert.equal(again.http, 409);
+  assert.equal(String((again.body as Record<string, unknown>)['reason']), '确认已使用');
+  assert.equal(outboxCount(), before + 1, '不得出现第二封邮件');
+});
+
+test('R9 — 跨实例 approval_id 不撞号、磁盘不丢记录（P2 回归）', async () => {
+  const a = freshService();
+  const b = new GatewayService(); // 构造时磁盘 seq=0；改前它会从 0 起算撞号
+
+  const mk = (svc: GatewayService, callId: string) =>
+    svc.handleToolCall(
+      { call_id: callId, tool_name: 'send_email', arguments: EMAIL_ARGS },
+      { user_id: USER },
+    );
+  const [r1, r2] = await Promise.all([mk(a, 'call_101'), mk(b, 'call_102')]);
+  const id1 = body(r1).approval_id!;
+  const id2 = body(r2).approval_id!;
+
+  assert.equal(body(r1).decision, 'require_approval');
+  assert.equal(body(r2).decision, 'require_approval');
+  assert.notEqual(id1, id2, '两个实例必须拿到不同的 approval_id');
+
+  const onDisk = JSON.parse(
+    fs.readFileSync(path.join(REPO_ROOT, 'server', 'data', 'approvals.json'), 'utf8'),
+  ) as { approvals: Array<{ approval_id: string }> };
+  const ids = onDisk.approvals.map((x) => x.approval_id);
+  assert.ok(
+    ids.includes(id1) && ids.includes(id2),
+    `磁盘必须同时保留两条记录，实际 [${ids.join(', ')}]`,
+  );
 });

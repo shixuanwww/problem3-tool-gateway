@@ -37,7 +37,8 @@ export function resetAll(): void {
   // 1) 运行期状态
   fs.mkdirSync(DATA_DIR, { recursive: true });
   for (const f of fs.readdirSync(DATA_DIR)) {
-    if (/\.(json|jsonl|tmp)$/.test(f) || f.includes('.corrupt-')) {
+    // 含 P2 新增的 `approvals.json.lock`（崩溃残留时清掉，避免下次启动白等锁超时）
+    if (/\.(json|jsonl|tmp|lock)$/.test(f) || f.includes('.corrupt-')) {
       fs.rmSync(path.join(DATA_DIR, f), { force: true });
     }
   }
@@ -81,7 +82,7 @@ const isMain =
 if (isMain) {
   resetAll();
   console.log('[reset] 已重置：');
-  console.log('  · server/data/*.json|*.jsonl —— 清空（approvals / audit / executions）');
+  console.log('  · server/data/*.json|*.jsonl|*.lock —— 清空（approvals / audit / executions / 文件锁）');
   console.log('  · sandbox/outbox/*.json —— 清空（保留 .gitkeep）');
   console.log(
     `  · sandbox/notes/ —— 恢复初始夹具：${Object.keys(INITIAL_NOTES).join(', ')}`,

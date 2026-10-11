@@ -14,10 +14,18 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { hashOfCall } from './canonical.ts';
 import { validateSchema } from './validate.ts';
-import { DATA_DIR, REPO_ROOT, resolveInSandbox } from './sandbox.ts';
+import { REPO_ROOT, resolveInSandbox } from './sandbox.ts';
 import { defaultRegistry, ToolRegistry } from './registry.ts';
-import { DEFAULT_TIMEOUT_MS, Executor } from './executor.ts';
-import { appendAudit } from './audit.ts';
+import { DEFAULT_TIMEOUT_MS, EXEC_FILE, Executor } from './executor.ts';
+import { appendAudit, AUDIT_FILE, readJsonl } from './audit.ts';
+import {
+  APPROVALS_FILE,
+  mergeApproval,
+  readStateSnapshot,
+  withStateLock,
+  writeApprovalsFile,
+} from './persist.ts';
+import { loadOrCreateApprovalSecret, secretMatches } from './secret.ts';
 import type {
   Approval,
   AuditEntry,
@@ -27,7 +35,8 @@ import type {
   ToolImpl,
 } from './types.ts';
 
-export const APPROVAL_FILE = path.join(DATA_DIR, 'approvals.json');
+/** 兼容旧引用：真实定义在 persist.ts（唯一写入口） */
+export const APPROVAL_FILE = APPROVALS_FILE;
 /** 确认有效期 300 秒（§11） */
 export const APPROVAL_TTL_MS = 300_000;
 
@@ -56,6 +65,11 @@ export interface GatewayOptions {
   /** 可注入的工具替身（用例 19 的超时桩） */
   tools?: Record<string, ToolImpl>;
   now?: () => number;
+  /**
+   * 用户确认通道的会话令牌（P1）。不传则从 server/data/approval-secret 载入或生成。
+   * 测试注入固定值以便直接断言；HTTP / MCP 入口一律用 Gateway 生成的那个。
+   */
+  approvalSecret?: string;
 }
 
 export interface HttpResult {
@@ -73,19 +87,42 @@ export class GatewayService {
   private readonly now: () => number;
   private readonly approvals = new Map<string, Approval>();
   private seq = { approval: 0, mail: 0 };
+  /** 确认接口必须携带的用户会话令牌（P1）。绝不回传给 Agent。 */
+  readonly approvalSecret: string;
 
   constructor(opts: GatewayOptions = {}) {
     this.registry = opts.registry ?? defaultRegistry;
     this.now = opts.now ?? (() => Date.now());
+    this.approvalSecret = opts.approvalSecret ?? loadOrCreateApprovalSecret();
     this.executor = new Executor({
       timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS,
       tools: opts.tools,
       now: this.now,
     });
     this.loadState();
+    this.reportCorruptJsonl();
   }
 
   // ---------------- 状态持久化 ----------------
+
+  /**
+   * PLAN §11 要求：`*.jsonl`（audit / executions）逐行解析、跳过并**计数**损坏行，
+   * 计数要写进启动日志。readJsonl() 本来就返回 corrupt，但改前没有任何调用方消费它
+   * ⇒ 一行坏掉会静默丢失。这里在构造时（= 进程启动）报一次。
+   */
+  private reportCorruptJsonl(): void {
+    for (const [label, file] of [
+      ['audit.jsonl', AUDIT_FILE],
+      ['executions.jsonl', EXEC_FILE],
+    ] as Array<[string, string]>) {
+      const { corrupt } = readJsonl(file);
+      if (corrupt > 0) {
+        console.error(
+          `[gateway] 警告：${label} 有 ${corrupt} 行无法解析，已跳过 —— 审计/执行记录可能不完整`,
+        );
+      }
+    }
+  }
 
   private loadState(): void {
     let text: string;
@@ -116,58 +153,57 @@ export class GatewayService {
     }
   }
 
-  private persistState(): void {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    const payload: PersistedState = {
-      seq: this.seq,
-      approvals: [...this.approvals.values()],
+  /**
+   * 把磁盘状态与内存状态**单调合并**进内存（必须在 withStateLock 内调用）。
+   *
+   * 合并规则见 persist.ts 的 mergeApproval()：used 只增不减、decided 一旦
+   * 落盘不被覆盖。这样别的进程刚写下的 `used=true` 不会被本进程的旧快照擦掉。
+   * 同时把别的进程新写的记录并入内存 —— 跨进程两阶段确认因此天然可见。
+   */
+  private mergeFromDiskLocked(): void {
+    const disk = readStateSnapshot();
+    if (!disk) return;
+    for (const a of disk.approvals) {
+      const mem = this.approvals.get(a.approval_id);
+      this.approvals.set(a.approval_id, mem ? mergeApproval(a, mem) : a);
+    }
+    this.seq = {
+      approval: Math.max(this.seq.approval, disk.seq.approval),
+      mail: Math.max(this.seq.mail, disk.seq.mail),
     };
-    const tmp = `${APPROVAL_FILE}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(payload, null, 2) + '\n', 'utf8');
-    fs.renameSync(tmp, APPROVAL_FILE); // 原子写：.tmp + rename
+  }
+
+  /** 必须在 withStateLock 内调用（否则会有读-改-写竞争） */
+  private persistStateLocked(): void {
+    this.mergeFromDiskLocked();
+    const payload: PersistedState = { seq: this.seq, approvals: [...this.approvals.values()] };
+    writeApprovalsFile(payload);
+  }
+
+  private persistState(): void {
+    withStateLock(() => this.persistStateLocked());
   }
 
   /**
-   * 从磁盘**再合并一次**（不覆盖本进程里已更新的记录，取 seq 最大值）。
-   *
-   * 为什么需要：题面的两阶段确认在 MCP 场景下跨进程 —— 待确认记录是 MCP stdio server
-   * 那个进程写盘的，而用户确认走的是 HTTP 进程的 `POST /approvals/{id}/decision`。
-   * 若 HTTP 进程只在构造时 `loadState()`，它就永远看不到这条记录，只会回
-   * "未找到待确认记录"（实测 409）。显式重读一次即可让文档写明的流程真正跑通。
-   *
-   * ⚠️ 这不等于"多进程安全"：并发的**写**仍会互相覆盖（README「未实现」第 2 条）。
-   *    本方法只保证"别的进程已经写下的记录，本进程能看见"。
+   * 分配 approval_id。必须在锁内把磁盘 seq 也读进来再 +1，
+   * 否则两个进程各自从 seq=0 起算会生成同一个 approval_id。
    */
-  private reloadState(): void {
-    let parsed: PersistedState;
-    try {
-      parsed = JSON.parse(fs.readFileSync(APPROVAL_FILE, 'utf8')) as PersistedState;
-    } catch {
-      return; // 不存在 / 损坏 / 正在被写成 tmp：静默跳过，绝不在此改名或重置
-    }
-    if (!parsed || !Array.isArray(parsed.approvals)) return;
-    for (const a of parsed.approvals) {
-      // 只补本进程没有的；本进程里更新的状态（如刚置位的 used）优先
-      if (!this.approvals.has(a.approval_id)) this.approvals.set(a.approval_id, a);
-    }
-    if (parsed.seq) {
-      this.seq = {
-        approval: Math.max(this.seq.approval, parsed.seq.approval ?? 0),
-        mail: Math.max(this.seq.mail, parsed.seq.mail ?? 0),
-      };
-    }
-  }
-
   private nextApprovalId(): string {
-    this.seq.approval += 1;
-    this.persistState();
-    return `approval_${String(this.seq.approval).padStart(3, '0')}`;
+    return withStateLock(() => {
+      const disk = readStateSnapshot();
+      this.seq.approval = Math.max(this.seq.approval, disk?.seq.approval ?? 0) + 1;
+      this.persistStateLocked();
+      return `approval_${String(this.seq.approval).padStart(3, '0')}`;
+    });
   }
 
   private nextMailId(): string {
-    this.seq.mail += 1;
-    this.persistState();
-    return `mail_${String(this.seq.mail).padStart(3, '0')}`;
+    return withStateLock(() => {
+      const disk = readStateSnapshot();
+      this.seq.mail = Math.max(this.seq.mail, disk?.seq.mail ?? 0) + 1;
+      this.persistStateLocked();
+      return `mail_${String(this.seq.mail).padStart(3, '0')}`;
+    });
   }
 
   private toolCtx() {
@@ -220,8 +256,14 @@ export class GatewayService {
   ): Promise<HttpResult> {
     const ts = new Date(this.now()).toISOString();
     const user_id = ctx.user_id;
-    const call_id = typeof call?.call_id === 'string' ? call.call_id : '';
-    const tool_name = typeof call?.tool_name === 'string' ? call.tool_name : '';
+    // 🔴 审计的 7 个必需字段要求非空：畸形请求（缺 call_id / tool_name）也要留痕，
+    //    所以这里用占位符而不是空串 —— 否则审计里会出现 call_id="" 这种无法对账的行。
+    const call_id =
+      typeof call?.call_id === 'string' && call.call_id.length > 0 ? call.call_id : '(missing)';
+    const tool_name =
+      typeof call?.tool_name === 'string' && call.tool_name.length > 0
+        ? call.tool_name
+        : '(missing)';
     const args = isPlainObject(call?.arguments) ? call.arguments : {};
     const base = { ts, user_id, call_id, tool_name };
     const policyNote = this.detectInjectedPolicy(ctx.rawBody);
@@ -436,7 +478,9 @@ export class GatewayService {
       user_id,
       tool_name,
       argument_hash: hash,
-      arguments_snapshot: { ...args }, // 确认后按快照执行（防 TOCTOU）
+      // 深拷贝快照：确认后一律按快照执行（防 TOCTOU）。浅拷贝会让嵌套对象与
+      // 调用方共享引用，理论上可被调用方在"提交 → 确认"之间改掉。
+      arguments_snapshot: structuredClone(args),
       created_at: createdAt,
       expires_at: new Date(this.now() + APPROVAL_TTL_MS).toISOString(),
       used: false,
@@ -476,7 +520,7 @@ export class GatewayService {
 
   async handleDecision(
     approvalId: string,
-    body: { action?: string; user_id?: string },
+    body: { action?: string; user_id?: string; approval_secret?: string },
   ): Promise<HttpResult> {
     const ts = new Date(this.now()).toISOString();
     const action = body?.action;
@@ -501,45 +545,31 @@ export class GatewayService {
       return { http, body: { approval_id: approvalId, status: 'denied', reason } };
     };
 
-    // 1 记录存在？
-    //   🔴 本进程内存里没有时，先重新合并一次磁盘状态：记录可能是**另一个进程**
-    //      （例如 MCP stdio server）写下的，而用户确认走的是本进程的 HTTP 端点。
-    //      题面的两阶段确认流程要求这条记录在这里可见。
-    let a = this.approvals.get(approvalId);
-    if (!a) {
-      this.reloadState();
-      a = this.approvals.get(approvalId);
-    }
-    if (!a) return rejectWith(409, '未找到待确认记录');
-
-    // 2 action 合法？
-    if (action !== 'approve' && action !== 'deny') {
-      return rejectWith(400, 'action 非法（只接受 approve / deny）', a);
+    // ---------------- 0 用户通道认证（P1 修复）----------------
+    // 🔴 题面：「该请求只能由 Client 根据用户的实际操作发起，Agent 无权替用户作出决定。」
+    //    确认接口必须携带**用户会话令牌**；Agent 通道 POST /tool-calls 拿不到它，
+    //    所以模型（或被网页注入的调用）无法自己 approve 自己。
+    //    先认证再看记录，避免未认证请求拿 approval_id 探测记录是否存在。
+    if (!secretMatches(this.approvalSecret, body?.approval_secret)) {
+      return rejectWith(
+        401,
+        '确认请求未通过用户通道认证：缺少或错误的用户会话令牌',
+        this.lookupForAudit(approvalId),
+      );
     }
 
-    // 3 未过期？
-    if (!(this.now() < Date.parse(a.expires_at))) {
-      return rejectWith(409, '确认已过期', a);
+    // ---------------- 1~6 查记录 / 六条拒绝 / 一次性置位（全部在文件锁内，P2 修复）----------------
+    //   🔴 跨进程并发确认同一个 approval_id 时，只有抢到锁的那个能通过"未使用"检查，
+    //      另一个必然读到 used=true 被拒 ⇒ 单机多进程（HTTP + MCP）也只会执行一次。
+    const claim = this.claimDecision(approvalId, action, userId);
+    if (!claim.ok) {
+      return rejectWith(claim.http, claim.reason, claim.approval, claim.approvalResult);
     }
-
-    // 4 未使用？
-    if (a.used) return rejectWith(409, '确认已使用', a);
-
-    // 5 同一用户？
-    if (userId !== a.user_id) return rejectWith(409, '确认者不是原用户', a);
-
-    // 6 未被拒绝过？
-    //    🔴 decided === undefined（尚未决策）是新建记录的正常状态，必须放行；
-    //       写成 `=== undefined` 会让所有确认在第一步就被判成"用户已拒绝"，场景 2 永远失败。
-    if (a.decided === 'deny') {
-      return rejectWith(409, '用户已拒绝该调用', a, 'denied');
-    }
+    const a = claim.approval;
 
     // ---------------- 通过 ----------------
 
-    if (action === 'deny') {
-      a.decided = 'deny';
-      this.persistState();
+    if (claim.effect === 'deny') {
       this.audit(
         { ts, user_id: a.user_id, call_id: a.call_id, tool_name: a.tool_name },
         {
@@ -557,16 +587,9 @@ export class GatewayService {
       };
     }
 
-    // 🔴🔴 一次性 + 并发：check 与 set 之间**不得出现 await**。
-    //      Node 事件循环是单线程的 ⇒ 这段同步代码是原子的 ⇒ 第二个并发请求
-    //      必然在本行之后才被处理，于是必定在第 4 条（已使用）被拒。
-    a.used = true;
-    a.decided = 'approve';
-    // 🔴🔴 而且必须**立刻落盘**：工具执行最长可能耗时一个 timeout（默认 5s），
-    //      若这期间进程被杀，重启后这条确认会带着 used=false 复活 ⇒ 重复副作用。
-    //      "同步置位"要同时置在内存和磁盘上，不能只置内存（实测改前磁盘上仍是 false）。
-    this.persistState();
-    // 此后才做异步工作
+    // approve：used=true / decided=approve 已在 claimDecision 的锁内**同步落盘**，
+    // 此后才做异步工作（执行工具）。执行最长可能耗时一个 timeout，若这期间进程被杀，
+    // 重启后这条确认不会带着 used=false 复活。
 
     const def = this.registry.get(a.tool_name);
     if (!def) {
@@ -660,6 +683,79 @@ export class GatewayService {
         reason: out.kind === 'timeout' ? '确认后执行超时' : `确认后执行失败: ${out.message}`,
       },
     };
+  }
+
+  /**
+   * 只读查找（内存 → 磁盘），用于**认证失败时的审计上下文**。
+   * 不写任何状态；返回的记录不会回传给调用方，只进审计日志。
+   */
+  private lookupForAudit(approvalId: string): Approval | undefined {
+    const mem = this.approvals.get(approvalId);
+    if (mem) return mem;
+    return readStateSnapshot()?.approvals.find((x) => x.approval_id === approvalId);
+  }
+
+  /**
+   * 在一个**文件锁临界区**内完成「查记录 → 六条拒绝条件 → 一次性置位 → 落盘」。
+   *
+   * 为什么要放进锁里（P2）：改前这段是"先读内存、再改内存、然后异步执行"，
+   * 单进程靠事件循环串行没问题，但 HTTP 与 MCP 是两个进程，两边都能通过
+   * "未使用"检查 ⇒ 同一个 approval_id 被执行两次。现在：
+   *   · 进入锁后先 mergeFromDiskLocked()，拿到的是磁盘上的最新状态；
+   *   · approve 时 `used = true` 与 `decided = 'approve'` 在同一临界区内写盘；
+   *   · 另一个进程随后进锁时读到 used=true，只能得到 409「确认已使用」。
+   * 锁的粒度只覆盖同步的文件 I/O，工具执行在锁外，不会阻塞其它确认。
+   */
+  private claimDecision(
+    approvalId: string,
+    action: string | undefined,
+    userId: string | undefined,
+  ):
+    | { ok: true; effect: 'approve' | 'deny'; approval: Approval }
+    | {
+        ok: false;
+        http: number;
+        reason: string;
+        approval?: Approval;
+        approvalResult: AuditEntry['approval_result'];
+      } {
+    return withStateLock(() => {
+      this.mergeFromDiskLocked();
+      const a = this.approvals.get(approvalId);
+      if (!a) return { ok: false as const, http: 409, reason: '未找到待确认记录', approvalResult: 'n/a' as const };
+
+      // action 合法？
+      if (action !== 'approve' && action !== 'deny') {
+        return { ok: false as const, http: 400, reason: 'action 非法（只接受 approve / deny）', approval: a, approvalResult: 'n/a' as const };
+      }
+      // 未过期？
+      if (!(this.now() < Date.parse(a.expires_at))) {
+        return { ok: false as const, http: 409, reason: '确认已过期', approval: a, approvalResult: 'n/a' as const };
+      }
+      // 未使用？
+      if (a.used) return { ok: false as const, http: 409, reason: '确认已使用', approval: a, approvalResult: 'n/a' as const };
+      // 同一用户？
+      if (userId !== a.user_id) {
+        return { ok: false as const, http: 409, reason: '确认者不是原用户', approval: a, approvalResult: 'n/a' as const };
+      }
+      // 未被拒绝过？
+      // 🔴 decided === undefined（尚未决策）是新建记录的正常状态，必须放行。
+      if (a.decided === 'deny') {
+        return { ok: false as const, http: 409, reason: '用户已拒绝该调用', approval: a, approvalResult: 'denied' as const };
+      }
+
+      if (action === 'deny') {
+        a.decided = 'deny';
+        this.persistStateLocked();
+        return { ok: true as const, effect: 'deny' as const, approval: a };
+      }
+
+      // 🔴 一次性 + 并发：check 与 set 之间不得出现 await，且整段在文件锁内。
+      a.used = true;
+      a.decided = 'approve';
+      this.persistStateLocked();
+      return { ok: true as const, effect: 'approve' as const, approval: a };
+    });
   }
 
   // ---------------- 供测试 / 演示 / MCP 使用 ----------------

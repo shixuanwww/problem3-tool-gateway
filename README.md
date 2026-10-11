@@ -54,6 +54,11 @@ node --experimental-strip-types --test --test-concurrency=1 tests/basic.test.ts 
 > 🔴 **测试必须带 `--test-concurrency=1`**：三个测试文件共用同一份 `sandbox/` 与 `server/data/`，`node --test` 默认**并行跑文件**会让"恰好 1 个文件"这类断言互相污染。文件内用例是顺序执行的。
 >
 > 🔴 **零第三方依赖**：没有 `npm install` 这一步，评审机上"一条命令就能跑"。`package.json` 里没有任何 `dependencies`。
+>
+> 🔴 **用户确认通道令牌（P1）**：Gateway 启动时会生成 `server/data/approval-secret`
+> 并打印在服务端终端；`client/` 会自动读取它，所以**演示命令不用改**。手工调
+> `POST /approvals/{id}/decision` 时必须带 `x-approval-secret`（或
+> `--approval-secret <token>` 给 Client），否则一律 `401`。
 
 ## 2. 架构
 
@@ -72,6 +77,8 @@ node --experimental-strip-types --test --test-concurrency=1 tests/basic.test.ts 
         │   gateway/service.ts    五步决策 / 确认 / 一次性│
         │   gateway/executor.ts   执行 + 超时 + 幂等判定  │
         │   gateway/audit.ts      审计（JSONL）          │
+        │   gateway/persist.ts    文件锁 + 单调合并持久化 │
+        │   gateway/secret.ts     用户通道令牌（P1）      │
         │   mcp/server.ts         手写 stdio JSON-RPC    │
         └───────────────────┬──────────────────────────┘
                             │ 只能经此读写
@@ -108,14 +115,19 @@ node --experimental-strip-types --test --test-concurrency=1 tests/basic.test.ts 
 | `require_approval` | 操作存在外部副作用 | 生成待确认记录，**但绝不提前执行工具** |
 | `deny` | 工具不存在 / 参数非法 / 目标越界 / 旧结论冲突 | 直接拒绝，带可读原因 |
 
-## 4. 沙箱：三道闸门（缺一不可）
+**HTTP 状态码**：业务拒绝仍是 `400`（未知工具/参数非法/越界/action 非法）与 `409`（确认类状态冲突）；
+`401` 专用于**用户通道没带对令牌**（`POST /approvals/{id}/decision`、`GET /audit`）；
+`413` 用于请求体超过 1MB；`503` 是持久化锁竞争/磁盘错误的兜底（不是策略决定，不写业务审计）。
 
-`read_note` / `delete_note` 只能访问 `sandbox/notes/`，`read_webpage` 只能访问 `sandbox/web/`。题面点名三种绕过方式，对应三道闸门：
+## 4. 沙箱：四道闸门（缺一不可）
 
+`read_note` / `delete_note` 只能访问 `sandbox/notes/`，`read_webpage` 只能访问 `sandbox/web/`。题面点名三种绕过方式；另外为了不出现"策略说 allow、执行才报错"的灰区，第三轮又补了一条：
+
+0. **拒绝控制字符（含 NUL）** —— JSON 里的 `\u0000` 不会被 `path.resolve` 拆掉，会一路走到 `fs` 层才抛错（表现成 `decision=allow / status=failed`），所以必须在策略阶段就 deny
 1. **拒绝绝对路径** —— `path.isAbsolute` + Windows 盘符 `^[A-Za-z]:` + UNC `\\server\share` + 前导 `/` `\`
-2. **拒绝任何含 `..` 的段** —— 在归一化**之前**按 `/` 与 `\` 切段判 `=== '..'`，所以 `a/../../b` 也拦得住（只看开头是不够的）
+2. **按段拒绝穿越形态**（在归一化**之前**切段）—— ① 只由点/空格组成的段（`..` / `.. ` / `...` / `....`，`.` 放行所以 `./todo.md` 仍可用）；② 段内出现 `:`（Windows ADS，`todo.md::$DATA`）。所以 `a/../../b` 也拦得住（只看开头是不够的）
 3. **归一化 + realpath + 前缀比对** —— 字符串前缀先挡一遍，再做 `fs.realpathSync`
-   - 🔴 **为什么第 3 步不能省**：`sandbox/notes/link` 是指向 `../../config.json` 的**符号链接**时，前两道闸门**全过**（路径里没有 `..`，也不是绝对路径），只有 realpath 能挡。
+   - 🔴 **为什么第 3 步不能省**：`sandbox/notes/link` 是指向 `../../config.json` 的**符号链接**时，前几道闸门**全过**（路径里没有 `..`，也不是绝对路径），只有 realpath 能挡。
 
 **`REPO_ROOT` 的定义（全项目唯一）**：
 
@@ -175,17 +187,20 @@ Client 是**Agent 的代理**：获取 Agent 生成的 `ToolCall`、提交给 Ga
 - **Basic**：Client + Gateway Server、三个工具（`send_email` / `read_note` / `delete_note`）、JSON Schema 参数校验、五步流程、三种决定、确认展示（工具名 + 完整参数）、题面三个基础场景
 - **进阶**：确认精确绑定 `argument_hash`（规范化 JSON → sha256）、一次性 + 并发安全、六条拒绝条件、沙箱三道闸门、7 字段审计、落盘 + 重启恢复（原子写 + 损坏改名保留）
 - **重复副作用的三道防线**（2026-10-11 审核后补强，见 §11）：① 同一调用**重发复用**同一条待确认记录（不再产生并列的多条）；② `used` 在 `await` **之前同步落盘**（进程被杀也不复活）；③ executor 维护"正在执行中"集合，**同键的非幂等调用并发执行一律拒绝**（用户已确认也拒 —— Gateway 说了算）
+- **用户通道认证（P1，2026-10-11 第二轮审核后补强）**：`POST /approvals/{id}/decision` 必须携带 Gateway 生成、只交给用户侧 Client 的**用户会话令牌**（`x-approval-secret` / 文件 `server/data/approval-secret`）。`POST /tool-calls`（Agent 通道）不要求、也拿不到它 ⇒ 模型或被提示词注入的调用**无法自己 approve 自己**。令牌比较用 `timingSafeEqual`，且**绝不出现在任何 `/tool-calls` 响应里**；HTTP 只绑回环地址
+- **同机多进程持久化安全（P2，同上）**：`gateway/persist.ts` 用**同目录锁文件**包住"读磁盘 → 单调合并 → 写磁盘"，临时文件带 pid+随机数。合并规则是 `used` 只增不减、`decided` 一旦落盘不被覆盖、`seq` 取最大值 ⇒ 修好了"跨进程把 `used=true` 擦回 `false`"与"两个进程撞同一个 approval_id"
+- **HTTP 兜底与边界收紧（第三轮，见 §11.3）**：请求处理整体 try/catch（持久化锁超时 → `503`，不再挂死/打挂进程）；超 1MB 请求体回 `413` 而不是掐连接；沙箱补"点/空格段 + ADS + NUL"三条拒绝；畸形请求的审计字段用 `(missing)` 占位而不是空串；启动时报告 `*.jsonl` 损坏行数；`GET /audit` 也走用户通道令牌
 - **Challenge**：MCP（手写 stdio JSON-RPC 2.0，**整个 stdio 会话共用一个 `GatewayService` 实例**）、`read_webpage` + 间接提示词注入演示、超时安全重试判定
-- **测试**：27 个用例，覆盖题面要求的 8 项 + 我们自加的 13 项（含 HTTP 端到端、并发、重启恢复、MCP、注入、超时、以及 R1–R6 六条回归）
+- **测试**：33 个用例，覆盖题面要求的 8 项 + 我们自加的部分（含 HTTP 端到端、并发、重启恢复、MCP、注入、超时、以及 R1–R9 九条回归与第三轮的 413/503/审计占位）
 
 ### ❌ 未实现（如实声明）
 
-1. 🔴 **`POST /approvals/{approval_id}/decision` 没有会话 / 令牌鉴权**。身份只按**请求体里的 `user_id`** 校验（六条拒绝条件里的第 5 条）。题面要求"该请求只能由 Client 根据用户的实际操作发起"，但本实现**无法从协议上阻止** Agent 自行 POST `{action:"approve", user_id:"user_default"}` 来伪造用户确认。真实系统必须由**会话或令牌**确定身份（`user_id` 从凭证推导，而不是请求体自报）。**这是已知的诚实边界，不假装已解决。**
-2. 🟠 **多进程仍不是"分布式安全"**：`approvals` 是进程内的 `Map` + 一个 JSON 文件。已修的部分：`handleDecision` 在内存里查不到记录时会**重新合并一次磁盘状态**，所以"MCP 进程写下的确认、HTTP 进程来确认"这条跨进程链路能跑通（用例 R6）；`seq` 取两边的最大值。**未修的部分**：并发的**写**仍会互相覆盖（last-writer-wins），真要上多实例必须换**文件锁 / 数据库唯一约束**（如 `UPDATE ... WHERE used = 0` 的原子 SQL）。本实现**不宣称**自己是分布式安全的。
+1. 🟠 **用户通道认证是"本机 control token"级别，不是真正的多用户鉴权**。已修：确认接口必须带 Gateway 签发的令牌，Agent 通道拿不到它 ⇒ 单靠自报 `user_id` 的伪造已被挡住（回归用例 R7，无令牌 / 错令牌都回 `401` 且无副作用）。**未修**：能读到 `server/data/approval-secret` 的本机进程仍可冒充用户；`user_id` 仍固定为 `user_default`、不是从凭证推导。真实系统应由 **OS 会话 / OAuth 令牌**确定身份，并给每个用户独立身份与授权范围。
+2. 🟠 **多进程只在"同一台机器"上是安全的**：`gateway/persist.ts` 的文件锁 + 单调合并修好了同机多进程（HTTP + MCP stdio）的并发写与 `used` 复活（回归用例 R8/R9，另有 4 进程并发实测：无撞号、无丢记录、同一个 approval 只有一个执行成功）。**未修**：跨机器 / 多副本仍不是分布式安全 —— 必须要数据库唯一约束（如 `UPDATE ... WHERE used = 0` 的原子 SQL）或分布式锁。本实现**不宣称**自己是分布式安全的。
 3. **重试判据只依赖进程内执行记录**（同 Q5 的诚实边界）。
 4. **`send_email` 不连真实邮件服务**（题面明确允许）：只写 `sandbox/outbox/<message_id>.json`。
 5. **不接真实大模型**（题面 Basic 明确允许"使用固定 JSON 模拟 Agent 输出"）：Client 读 `client/scripts/*.json`。
-6. **无鉴权 / 无 TLS / 无多用户隔离**：仅绑定本机，`user_default` 是唯一的真实用户。
+6. **无 TLS / 无多用户隔离**：HTTP 已改为只绑 `127.0.0.1`（改前 `listen(port)` 会监听所有网卡），但仍没有 TLS、没有多用户隔离，`user_default` 是唯一的真实用户。
 7. **MCP 只实现 `initialize` / `tools/list` / `tools/call`**，未实现 `resources` / `prompts` / 采样等其余能力。
 
 ## 8. 演示步骤
@@ -283,4 +298,35 @@ problem3-tool-gateway/
 
 **同时补强**：executor 新增 `inFlight` 集合 —— 同键的**非幂等**调用若正在执行，**即使已获用户确认也拒绝**（返回 409，审计记 `decision=deny / approval_result=approved / execution_result=skipped`）。这条不能由 `allowAfterTimeout` 放开：一次确认只授权"再执行一次"，不授权"和正在跑的那次并行再跑一次"（回归用例 R3）。
 
-> 诚实边界：修复 1/3 针对的是**单进程内**的并发与崩溃；多进程并发的**写**仍会互相覆盖（§7「未实现」第 2 条）。
+> 诚实边界（第一轮）：上面 1/3 的修复针对的是**单进程内**的并发与崩溃 —— 多进程写的覆盖问题在第一轮之后仍然存在，已在第二轮（下节）修掉。
+
+### 11.2 第二轮审核修复（2026-10-11，P1 / P2）
+
+第二轮审计逐条对照题面，实测复现了两个**题面级别**的问题，并修掉：
+
+| # | 缺陷（实测） | 修法 | 回归 |
+|---|---|---|---|
+| P1 | **确认端点只信请求体自报的 `user_id`** ⇒ 任何人都能 `POST /approvals/{id}/decision {"action":"approve","user_id":"user_default"}` 让 `send_email` 真执行。题面明说"该请求只能由 Client 根据用户的实际操作发起，Agent 无权替用户作出决定" | 新增 `gateway/secret.ts`：Gateway 生成**用户会话令牌**（落 `server/data/approval-secret`、启动时打印一次），确认端点必须带 `x-approval-secret`（或 body `approval_secret`），用 `timingSafeEqual` 比较；**令牌从不出现在 `/tool-calls` 响应里**。Agent 通道不需要令牌（Agent 只负责提出调用）。顺带把 HTTP 从"监听所有网卡"改成只绑 `127.0.0.1` | R7 |
+| P2 | **跨进程持久化有数据竞争**：① 固定临时名 `approvals.json.tmp` 并发写会抛 `ENOENT: rename`（实测 `node --test` 不带 `--test-concurrency=1` 时 8 个用例因此报错）；② `persistState()` 把本进程内存**全量覆盖**磁盘 ⇒ 会把别的进程刚写下的 `used=true` 擦回 `false`（确认复活 ⇒ 重复副作用）；③ 两个进程各自从 `seq=0` 起算 ⇒ **同一个 approval_id** | 新增 `gateway/persist.ts`：同目录**锁文件**（`open('wx')`，带超时与 15s 僵尸锁抢占）包住"读磁盘 → 单调合并 → 写磁盘"；临时文件带 pid+随机数；`mergeApproval()` 对 `used` 取或、`decided` 磁盘优先、`seq` 取最大。确认的"查 `used` → 置 `used`"整段也挪进锁内 ⇒ 同机多进程也只有一个赢家 | R8、R9 |
+
+**实测证据**（探针脚本见 `D:\aoce\_probe\t3-p2-writer.mts` / `t3-p2-approver.mts`）：
+
+- 4 个真实进程在同一份状态上并发创建：拿到 `approval_001..004` **四个不同 id**，磁盘 4 条记录一条不丢；
+- 2 个真实进程同时确认**同一个** `approval_id`：一个 `200 executed`、一个 `409 确认已使用`，`sandbox/outbox/` **恰好 1 封邮件**；
+- HTTP 端到端：无令牌 → `401` 且 outbox 为空；错令牌 → `401`；正确令牌 → `executed`，重复确认 → `409 确认已使用`。
+
+> 残余诚实边界：① 令牌是**本机文件级**能力（同机能读到该文件的进程可冒充用户），真正的多用户鉴权要由 OS 会话 / OAuth 派生；② 文件锁只解决**同一台机器**的多进程，跨机器/多副本仍需数据库唯一约束；③ 三个测试文件仍共用同一份 `sandbox/`，所以测试**必须**用 `npm test`（已内置 `--test-concurrency=1`），并行跑文件会因夹具互相覆盖而出现计数类断言失败 —— 这是测试夹具共享问题，不是运行时数据竞争。
+
+### 11.3 第三轮审计修复（2026-10-11，健壮性与边界）
+
+第二轮把 P1/P2 修完之后，审计又逐条复验了"还没修的加固项"，并发现一个**由 P2 引入的新缺陷**（锁会抛异常，而 HTTP 层没接住）。逐条修掉，各留回归：
+
+| # | 问题（实测） | 修法 | 回归 |
+|---|---|---|---|
+| A | **锁超时异常穿透 HTTP 层**：`createHttpServer` 的 async handler 没有 try/catch，`withStateLock` 抛错后请求**永久挂起**（客户端只能自己超时），并产生 unhandledRejection（Node 默认策略会**打挂进程**）。实测：客户端 9.0s 无响应 | 处理函数抽成 `handleRequest()`，`createHttpServer` 统一 `.catch()` → `503` + stderr 日志；锁等待从 5s 收到 **1.5s**（等待期间是同步阻塞，不能长） | 用例 21（实测 1.5s 回 503、无 unhandled） |
+| B | **>1MB 请求体被掐连接**：`readBody` 超限时先 `req.destroy()`，客户端只拿到 `fetch failed`，收不到承诺的 400 | 不再 destroy：把 `tooLarge` 结果交回上层，响应 `413`（剩余 body 由已挂的 `data` 监听器自然丢弃） | 用例 20（实测 HTTP 413） |
+| C | **沙箱对"解析不了的路径形态"放行**：`.. /web/promo.html`、`....//config.json`、含 NUL 的路径都返回 `decision=allow / status=failed`；`todo.md::$DATA` 甚至 `allow / executed` | 闸门 0 拒绝控制字符；闸门 2 改为"只由点/空格组成的段（`.` 除外）一律拒" + "段内含 `:` 一律拒"。正常写法 `./todo.md`、`my note.md` 仍放行 | 用例 6（扩到 7 个路径 + 符号链接/junction） |
+| D | **畸形请求的审计字段是空串**：`call_id="" / tool_name=""`，与"必需字段非空"口径不符 | `handleToolCall` 用 `(missing)` 占位，畸形请求也留痕 | 用例 22 |
+| E | **`*.jsonl` 损坏行只计数、从不输出**（PLAN §11 要求写进启动日志） | 构造服务时读一次 audit/executions，`corrupt > 0` 就打 stderr 警告 | 手工验证（输出`警告：audit.jsonl 有 1 行无法解析`） |
+| F | **`GET /audit` 无认证**，Agent 能读到别人的调用记录 | 复用用户通道令牌：没带 / 带错 → `401`；Client 自动带上 | 端到端用例（401 → 200） |
+| G | 死代码：`secret.ts` 的 `secretFingerprint`、`executor.ts` 的 `export { argumentHash }` | 删除 | — |

@@ -22,7 +22,7 @@
 | 2.3 | §4.10 说非幂等超时"转 `require_approval` 让人工确认" —— 但**没有定义人工确认之后能不能执行** | `/approvals/{id}/decision` 走 `allowAfterTimeout: true`，放行一次 | 不放开就是**死锁**：用户确认了，`executor.run` 又因为"存在 timeout 记录"把人拦住，邮件永远发不出去。人工的显式确认是唯一能越过这道闸门的钥匙。**注意 `success` 记录仍然一律不重跑，这条不放宽** |
 | 2.4 | `/approvals/{id}/decision` 被拒绝时，那条审计的 `decision` 字段填什么？ | 填 `deny`（净效果 = 该调用被否定）；`action=deny` 的正常路径同样填 `deny` | §11 要求"一次请求恰好一条审计"且 `decision` 必需非空。审核口径：这条审计描述的是**该调用的最终归属** |
 | 2.5 | PLAN §7 的 `server/index.ts` 端点表里 `GET /audit` 是"可选" | 实现了 | 演示与测试都要用（客户端收尾打印、`assert` 审计条数）。零成本 |
-| 2.6 | `user_id` 在 HTTP 层怎么取？ | **硬写 `user_default`**，请求体里带了也忽略 | 与"Agent 不得覆盖"的口径一致 —— 但要知道这只是**占位**：真正的身份必须来自会话/令牌（README「未实现」第 1 条） |
+| 2.6 | `user_id` 在 HTTP 层怎么取？ | **硬写 `user_default`**，请求体里带了也忽略；确认接口另需**用户会话令牌** `x-approval-secret`（P1 之后） | 与"Agent 不得覆盖"的口径一致 —— 但要知道 `user_id` 仍只是**占位**：真正的身份必须来自会话/令牌（README「未实现」第 1 条）。令牌本身解决的是"Agent 不能自己确认"，不是"多用户身份" |
 
 ## 3. 被 PLAN 预判到的坑（实测遇到了，如实记录）
 
@@ -45,8 +45,8 @@
 
 ## 5. 未做（明确不做，不是漏做）
 
-- 多进程 / 分布式"一次性"保证（README「未实现」第 2 条，如实声明）
-- `/approvals/{id}/decision` 的会话 / 令牌鉴权（README「未实现」第 1 条，如实声明）
+- 跨机器 / 分布式"一次性"保证。**同机多进程**已在 P2 修复中用文件锁 + 单调合并覆盖（README「未实现」第 2 条只保留跨机部分）
+- 真正的多用户身份鉴权（从 OS 会话 / OAuth 推导 `user_id`）。**「Agent 不能自己 approve」**已在 P1 修复中用用户会话令牌覆盖；残余边界是"能读到 `server/data/approval-secret` 的本机进程仍可冒充用户"
 - MCP 的 `resources` / `prompts` / 采样等其余能力（题面只要求 tools）
 - 真实邮件服务、真实大模型（题面明确不要求）
 
@@ -60,8 +60,35 @@
 | 6.2 | §4.7「`used = true` 必须写在任何 `await` 之前（Node 单线程保证原子）」 | 同上，**外加"立刻 `persistState()`"** | PLAN 只说"同步置位"，没说置到哪。实现理解成了内存 ⇒ 执行期间（默认 timeout 5s）进程被杀，重启后确认带着 `used:false` 复活（实测磁盘上就是 false）。原子性必须同时覆盖内存与磁盘 |
 | 6.3 | §4.10 / §2.3（本文件）「非幂等超时 ⇒ 转人工确认，用户确认后 `allowAfterTimeout` 放行一次」 | 放行**仍保留**，但新增 executor 的 `inFlight` 集合：**同键非幂等调用正在执行时，即使 `allowAfterTimeout` 也拒绝** | `allowAfterTimeout` 是"这次确认"的豁免，被实现成了"整个 run 的豁免"。于是"查记录 → 写 started → await 工具"这段窗口内，第二个请求看到的最新记录是 `started`，带着豁免就冲过去了 ⇒ 并发重复副作用。豁免必须限定在"人工对**已结束的**不确定结果重新确认"，而不是"和正在跑的那次并行" |
 | 6.4 | PLAN §7/§9：`server/mcp/server.ts` 从 stdin 读、从 stdout 写 | 同上，**外加"审计终端镜像走 stderr"** | PLAN 只写了 stdout 是响应通道，没提审计也要打印。`appendAudit` 的 `console.log` 会把 `[audit] ...` 写进 stdout ⇒ 破坏 JSON-RPC 流（实测 stdout 混入审计行） |
-| 6.5 | PLAN 未规定 MCP 的 `GatewayService` 生命周期 | `startStdioServer` **全程一个实例**；`handleDecision` 内存未命中时 **`reloadState()`** 再查一次 | 题面要求"MCP 请求经过**同一个** Gateway"。改前每条消息 `new GatewayService()`，且 HTTP 进程只在构造时 `loadState()` ⇒ MCP 写的确认，HTTP 端点看不见，两阶段确认回 409"未找到待确认记录"（实测） |
+| 6.5 | PLAN 未规定 MCP 的 `GatewayService` 生命周期 | `startStdioServer` **全程一个实例**；`handleDecision` 进锁后先合并磁盘状态再查（第二轮 P2 把这里的 `reloadState()` 换成了 `mergeFromDiskLocked()`，见 §7） | 题面要求"MCP 请求经过**同一个** Gateway"。改前每条消息 `new GatewayService()`，且 HTTP 进程只在构造时 `loadState()` ⇒ MCP 写的确认，HTTP 端点看不见，两阶段确认回 409"未找到待确认记录"（实测） |
 
 **新增回归用例**：`tests/advanced.test.ts` 的 **R1–R6**（27 个用例总数，`# fail 0`）。
 
 > 修复 6.1/6.2 的作用域是**单进程**；多进程并发的**写**仍会互相覆盖，README「未实现」第 2 条已如实收窄措辞（由"单进程模型"改为"跨进程可读、但并发写不安全"）。
+
+## 7. 第二轮审核修复（2026-10-11，P1 / P2）
+
+第二轮审计第一次**真正按题面验收**，发现两个题面级问题（第一轮 27 个用例全绿也没覆盖到）：
+
+| # | 问题 | 修法 | 与 PLAN 的关系 |
+|---|---|---|---|
+| P1 | 确认接口只信请求体自报的 `user_id` ⇒ 任何人都能让高风险工具执行，违背题面"该请求只能由 Client 根据用户的实际操作发起，Agent 无权替用户作出决定" | 新增 `server/gateway/secret.ts`：Gateway 生成用户会话令牌，确认端点必须携带（`x-approval-secret` / body `approval_secret`），常量时间比较；令牌**不回传**给 Agent 通道。HTTP 另改为只绑 `127.0.0.1` | PLAN §4.6 第 5 条只要求"确认者不是原用户要拒"，**没有规定怎么证明"是原用户"**。本轮按题面把"自报"升级为"持有用户通道令牌" |
+| P2 | ① 固定临时名导致跨进程写抛 `ENOENT`；② 全量覆盖导致 `used=true` 被擦回 `false`；③ 两个进程从 `seq=0` 起算撞同一个 `approval_id` | 新增 `server/gateway/persist.ts`：锁文件临界区 + 唯一临时名 + 单调合并（`used` 取或 / `decided` 磁盘优先 / `seq` 取最大）；`claimDecision` 的"查→判→置位→落盘"整段进锁 | PLAN §11 只写了"单进程 + 单线程天然串行"，并**明确声明多进程不支持**。本轮把"同机多进程"真正修好（跨机仍不支持） |
+
+回归用例：`R7`（无令牌/错令牌 → 401 且无副作用）、`R8`（跨实例不擦 `used`）、`R9`（跨实例不撞号、不丢记录）。另有真·多进程探针：4 进程并发创建无撞号，2 进程并发确认同一 `approval_id` 只有一次执行。
+
+## 8. 第三轮审核修复（2026-10-11，健壮性与边界）
+
+### 8.1 与 PLAN 的冲突
+
+| # | PLAN 的口径 | 实现 | 为什么 |
+|---|---|---|---|
+| 8.1 | §11 拒绝码"只用 400 / 409" | 新增 **401**（用户通道令牌不对）、**413**（body 超 1MB）、**503**（持久化锁竞争/IO 错误兜底） | P1 的令牌没有 401 就说不清；413/503 是 HTTP 语义本身，不属于"业务拒绝"。README §3 已列全 |
+| 8.2 | §11 "`*.jsonl` 逐行解析、跳过并计数损坏行，**计数写进启动日志**" | 照做：`GatewayService` 构造时 `reportCorruptJsonl()` | 改前 `readJsonl` 返回了 `corrupt` 但无人消费 ⇒ 实际是"静默跳过"，与 PLAN 不符 |
+| 8.3 | §4.4 只要求拦"绝对路径 / `..` / 符号链接" | 在闸门 2 额外拒绝**只由点/空格组成的段**与**含 `:` 的段**，并新增闸门 0 拒绝控制字符 | 这三类改前的表现是 `decision=allow / status=failed`（ADS 那条是 `allow / executed`）—— 题面要的是 deny，且"策略允许、执行才报错"会让客户端看到自相矛盾的结论 |
+
+### 8.2 第二轮引入的缺陷（本轮修掉）
+
+`withStateLock` 会抛异常（锁等待超时、文件锁不可用），但 `server/index.ts` 的 async handler **没有 try/catch**：请求会永久挂起，并按 Node 默认策略把进程打挂。实测（占住锁后发请求）：客户端 9.0s 无响应、进程报 `unhandledRejection`。
+
+修法：抽出 `handleRequest()`，在 `createHttpServer` 里统一 `.catch()` → `503`；锁等待上限 5s → 1.5s（等待期间是 `Atomics.wait` **同步阻塞整个事件循环**，必须短）。回归用例 21。

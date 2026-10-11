@@ -12,7 +12,7 @@ import { readAudit } from '../server/gateway/audit.ts';
 import { handleMcpMessage } from '../server/mcp/server.ts';
 import { builtinTools } from '../server/tools/index.ts';
 import type { ToolCallResponse, ToolImpl } from '../server/gateway/types.ts';
-import { freshService, outboxCount, resetAll, USER } from './helpers.ts';
+import { decide, freshService, outboxCount, resetAll, USER } from './helpers.ts';
 
 function body(r: { body: unknown }): ToolCallResponse {
   return r.body as ToolCallResponse;
@@ -127,10 +127,7 @@ test('用例 18 — 提示词注入：只读网页 allow，但诱导出的外发
   assert.equal(outboxCount(), before, '确认前不得有邮件');
 
   // 第 3 步：用户拒绝 ⇒ 无邮件落盘
-  const denied = await svc.handleDecision(body(send).approval_id!, {
-    action: 'deny',
-    user_id: USER,
-  });
+  const denied = await decide(svc, body(send).approval_id!, 'deny');
   assert.equal(String((denied.body as Record<string, unknown>)['status']), 'denied');
   assert.equal(outboxCount(), before, '用户拒绝后不得有邮件落盘');
 
@@ -171,7 +168,7 @@ test('用例 19 — 超时判定：非幂等不自动重试（转人工确认）
   assert.equal(body(r1).decision, 'require_approval');
   const a1 = body(r1).approval_id!;
 
-  const exec = await svc.handleDecision(a1, { action: 'approve', user_id: USER });
+  const exec = await decide(svc, a1, 'approve');
   assert.equal(String((exec.body as Record<string, unknown>)['status']), 'failed', '确认后执行超时');
   assert.equal(readAudit('call_001').at(-1)!.execution_result, 'timeout');
 

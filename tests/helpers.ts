@@ -24,6 +24,37 @@ export function freshService(opts: GatewayOptions = {}): GatewayService {
   return new GatewayService(opts);
 }
 
+/**
+ * 带**用户通道令牌**的确认 / 拒绝（P1 之后 handleDecision 必须携带它）。
+ * 测试用 `svc.approvalSecret`，等价于真实 Client 读 server/data/approval-secret。
+ */
+export function decide(
+  svc: GatewayService,
+  approvalId: string,
+  action: 'approve' | 'deny',
+  userId: string = USER,
+) {
+  return svc.handleDecision(approvalId, {
+    action,
+    user_id: userId,
+    approval_secret: svc.approvalSecret,
+  });
+}
+
+/** 故意用非法 action（仍带正确令牌），用于 action 校验用例 */
+export function decideWithAction(
+  svc: GatewayService,
+  approvalId: string,
+  action: string,
+  userId: string = USER,
+) {
+  return svc.handleDecision(approvalId, {
+    action,
+    user_id: userId,
+    approval_secret: svc.approvalSecret,
+  });
+}
+
 export function outboxCount(): number {
   return listOutbox().length;
 }

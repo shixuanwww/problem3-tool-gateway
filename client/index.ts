@@ -41,6 +41,28 @@ function arg(name: string, fallback?: string): string | undefined {
 
 const BASE_URL = arg('url', 'http://127.0.0.1:8787')!;
 
+/**
+ * 用户确认通道令牌（P1）。
+ *
+ * 来源优先级：`--approval-secret` > Gateway 落盘的 server/data/approval-secret。
+ * 它只用于**用户确认**这一步，绝不写进 ToolCall、也不回传给 Agent；
+ * 所以被提示词注入的模型没法绕过用户自己 approve。
+ */
+function resolveApprovalSecret(): string | undefined {
+  const fromArg = arg('approval-secret');
+  if (fromArg) return fromArg;
+  try {
+    const text = fs
+      .readFileSync(path.join(REPO_ROOT, 'server', 'data', 'approval-secret'), 'utf8')
+      .trim();
+    return text.length > 0 ? text : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+const APPROVAL_SECRET = resolveApprovalSecret();
+
 function loadScript(fileName: string): ToolCall {
   const p = path.join(SCRIPTS_DIR, fileName);
   return JSON.parse(fs.readFileSync(p, 'utf8')) as ToolCall;
@@ -151,7 +173,20 @@ async function runOne(
     );
   }
 
-  const d = await submitDecision(BASE_URL, resp.approval_id!, action, USER_ID);
+  // 🔴 确认前必须持有用户通道令牌；没有就明确拒绝，绝不"降级成不带令牌"。
+  if (!APPROVAL_SECRET) {
+    throw new Error(
+      '找不到用户确认令牌：请先启动 Gateway（它会生成 server/data/approval-secret），' +
+        '或显式传 `--approval-secret <token>`（令牌打印在 Gateway 终端）。',
+    );
+  }
+  const d = await submitDecision(
+    BASE_URL,
+    resp.approval_id!,
+    action,
+    USER_ID,
+    APPROVAL_SECRET,
+  );
   console.log(`HTTP ${d.status}  ←  POST /approvals/${resp.approval_id}/decision  action=${action}`);
   console.log(JSON.stringify(d.body, null, 2));
 
@@ -162,7 +197,11 @@ async function runOne(
 async function printAuditTail(n: number): Promise<void> {
   line();
   console.log(`审计日志尾部（GET /audit）—— 题面要求的 5 个字段在这里：`);
-  const r = await fetchAudit(BASE_URL);
+  const r = await fetchAudit(BASE_URL, undefined, APPROVAL_SECRET);
+  if (r.status === 401) {
+    console.log('  （缺少用户通道令牌，读不到审计 —— 请先启动 Gateway 或传 --approval-secret）');
+    return;
+  }
   const rows = (Array.isArray(r.body) ? r.body : []) as Record<string, unknown>[];
   for (const row of rows.slice(-n)) {
     console.log(

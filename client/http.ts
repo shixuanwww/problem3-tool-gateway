@@ -39,15 +39,28 @@ export function submitDecision(
   approvalId: string,
   action: 'approve' | 'deny',
   userId: string,
+  approvalSecret: string,
 ): Promise<HttpReply> {
   return request(baseUrl, `/approvals/${encodeURIComponent(approvalId)}/decision`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      // 🔴 用户通道令牌：Agent 的 ToolCall 里没有它，也拿不到它。
+      'x-approval-secret': approvalSecret,
+    },
     body: JSON.stringify({ action, user_id: userId }),
   });
 }
 
-export function fetchAudit(baseUrl: string, callId?: string): Promise<HttpReply> {
+export function fetchAudit(
+  baseUrl: string,
+  callId?: string,
+  approvalSecret?: string,
+): Promise<HttpReply> {
   const q = callId ? `?call_id=${encodeURIComponent(callId)}` : '';
-  return request(baseUrl, `/audit${q}`, { method: 'GET' });
+  return request(baseUrl, `/audit${q}`, {
+    method: 'GET',
+    // /audit 也走用户通道（审计里有别人的调用记录，不该给 Agent 看）
+    ...(approvalSecret ? { headers: { 'x-approval-secret': approvalSecret } } : {}),
+  });
 }

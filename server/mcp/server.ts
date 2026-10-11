@@ -114,10 +114,12 @@ export async function handleMcpMessage(
       if (body['decision'] === 'require_approval') {
         // MCP 是同步请求-响应，没有交互通道问用户 ⇒ 两阶段：
         //   ① 用户走 HTTP 端点 `POST /approvals/{approval_id}/decision` 确认/拒绝
-        //      （GatewayService.handleDecision 会顺带 reloadState，因此**跨进程**也看得见这条记录）；
+        //      （handleDecision 在文件锁内会先合并磁盘状态，因此**跨进程**也看得见这条记录）；
         //   ② 确认执行成功之后，客户端以**同一 call_id 重发** tools/call，
         //      这次命中"已获确认并执行完毕"分支，直接取回结果。
         // 🔴 只"重发"不确认是不会执行的 —— 重发只会拿回同一条待确认记录（approval_id 不变）。
+        // 🔴 用户通道令牌（P1）：确认请求还必须带 `x-approval-secret`。它**故意不在这里回传**
+        //    —— Agent/模型拿不到它，只有用户侧的 Client 持有（server/data/approval-secret）。
         return rpcOk(id, {
           content: [
             {
@@ -126,6 +128,8 @@ export async function handleMcpMessage(
                 `该调用需要用户确认，Gateway 未执行任何操作。approval_id=${String(body['approval_id'] ?? '')}。\n` +
                 `请用户通过 POST /approvals/${String(body['approval_id'] ?? '')}/decision ` +
                 `选择 {"action":"approve"|"deny","user_id":"<原用户>"}；\n` +
+                `该请求必须携带用户通道令牌头 x-approval-secret（由用户侧 Client 持有，` +
+                `存在 server/data/approval-secret，不在本响应中回传）。\n` +
                 `确认成功后，以**同一 call_id** 重发本次 tools/call 即可取回执行结果` +
                 `（call_id=${call_id}）。\n` +
                 `🔴 annotation 中的 readOnlyHint 等不作为权限依据。`,
