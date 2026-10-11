@@ -208,11 +208,14 @@ test('用例 15 — 审计含题面要求的 5 个日志字段', async () => {
 
   const rows = readAudit();
   assert.ok(rows.length >= 3);
+  // 注：decision / execution_result 是字面量 union，TS 认为 `!== ''` 恒真；
+  //     这里要断的是"运行时非空字符串"，所以统一转成 string 再比。
+  const nonEmpty = (v: unknown) => typeof v === 'string' && String(v).length > 0;
   for (const row of rows) {
-    assert.ok(typeof row.call_id === 'string' && row.call_id !== '');
-    assert.ok(typeof row.tool_name === 'string' && row.tool_name !== '');
-    assert.ok(typeof row.decision === 'string' && row.decision !== '');
-    assert.ok(typeof row.execution_result === 'string' && row.execution_result !== '');
+    assert.ok(nonEmpty(row.call_id), 'call_id 必须非空');
+    assert.ok(nonEmpty(row.tool_name), 'tool_name 必须非空');
+    assert.ok(nonEmpty(row.decision), 'decision 必须非空');
+    assert.ok(nonEmpty(row.execution_result), 'execution_result 必须非空');
   }
   // approval_id 必须能在待确认/确认记录里读到
   const withApproval = rows.filter((r) => r.decision === 'require_approval');
